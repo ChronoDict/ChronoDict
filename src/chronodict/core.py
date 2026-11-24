@@ -1,13 +1,14 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates and bounded delta history."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates, bounded delta history and configurable retention."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
 from copy import deepcopy
 from threading import RLock
 from sys import getsizeof
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 _MISSING = object()
+_UNCHANGED = object()
 # Per-key checkpoint cadence bounds historical replay to 31 deltas.
 _CHECKPOINT_INTERVAL = 32
 _RANGE_OPS = {"gt": gt, "gte": ge, "lt": lt, "lte": le}
@@ -98,7 +99,7 @@ class _Tracked:
 
     def _root(self):
         records = self._owner._history.get(self._key, ())
-        if not records or records[-1][0] != self._revision or self._key not in self._owner._data:
+        if not records or self._owner._key_revisions.get(self._key) != self._revision or self._key not in self._owner._data:
             raise RuntimeError('Stale ChronoDict view; retrieve the key again')
         return self._owner._data[self._key]
 
@@ -219,11 +220,16 @@ class _TrackedList(_Tracked, MutableSequence):
 class ChronoDict(MutableMapping):
     """Revisioned mapping with optional live nested dict/list mutation tracking."""
 
-    def __init__(self, data=None, *, indexes=(), track_mutations=True):
+    def __init__(self, data=None, *, indexes=(), track_mutations=True, max_revisions=None, max_age=None):
         self._lock = RLock()
         self._track_mutations = track_mutations
         self._data = {}
         self._history = {}
+        self._key_revisions = {}
+        self._oldest_revision = 0
+        self._validate_retention(max_revisions, max_age)
+        self._max_revisions = max_revisions
+        self._max_age = max_age
         self._indexes = {field: {} for field in indexes}
         self._range_indexes = {field: {} for field in self._indexes}
         self._composite_indexes = {}
@@ -231,6 +237,96 @@ class ChronoDict(MutableMapping):
         self._times = [datetime.now(timezone.utc)]
         if data is not None:
             self.update(data)
+
+    @staticmethod
+    def _validate_retention(max_revisions, max_age):
+        """Validate optional retained revision count and positive timedelta."""
+        if max_revisions is not None and (type(max_revisions) is not int or max_revisions < 1):
+            raise ValueError('max_revisions must be a positive integer or None')
+        if max_age is not None and (not isinstance(max_age, timedelta) or max_age <= timedelta(0)):
+            raise ValueError('max_age must be a positive timedelta or None')
+
+    @property
+    def oldest_revision(self):
+        """Lowest accessible revision; revision identifiers never change."""
+        with self._lock:
+            return self._oldest_revision
+
+    def set_retention(self, *, max_revisions=_UNCHANGED, max_age=_UNCHANGED):
+        """Change policies and prune immediately; None disables a policy.
+
+        Discarded history cannot be recovered by relaxing retention.
+        """
+        with self._lock:
+            count = self._max_revisions if max_revisions is _UNCHANGED else max_revisions
+            age = self._max_age if max_age is _UNCHANGED else max_age
+            self._validate_retention(count, age)
+            self._max_revisions, self._max_age = count, age
+            return self.prune()
+
+    def prune(self):
+        """Apply retention now, including after an idle period; return floor."""
+        with self._lock:
+            return self._prune_policy(max(self._times[-1], datetime.now(timezone.utc)))
+
+    def _prune_policy(self, now):
+        floor = self._oldest_revision
+        if self._max_revisions is not None:
+            floor = max(floor, self._revision - self._max_revisions + 1)
+        if self._max_age is not None:
+            # Retain the state at the age boundary, including an older anchor
+            # if no mutation occurred exactly at that time.
+            try:
+                cutoff = now - self._max_age
+            except OverflowError:
+                cutoff = datetime.min.replace(tzinfo=timezone.utc)
+            floor = max(floor, self._oldest_revision + bisect_right(self._times, cutoff) - 1)
+        if floor > self._oldest_revision:
+            self._prune_before(floor)
+        return self._oldest_revision
+
+    @staticmethod
+    def _trim_postings(index, floor):
+        """Keep intervals intersecting the retained timeline."""
+        result = {}
+        for value, postings in index.items():
+            retained = {}
+            for key, intervals in postings.items():
+                active = [[max(start, floor), end] for start, end in intervals
+                          if end is None or end > floor]
+                if active:
+                    retained[key] = active
+            if retained:
+                result[value] = retained
+        return result
+
+    def _prune_before(self, floor):
+        """Materialize boundary checkpoints before releasing expired history."""
+        history = {}
+        for key, records in self._history.items():
+            pos = bisect_right(records, floor, key=lambda record: record[0])
+            if not pos:
+                history[key] = records
+                continue
+            boundary = self._at(key, floor)
+            retained = records[pos:]
+            if boundary is not _MISSING:
+                retained.insert(0, (floor, boundary, False))
+            if retained:
+                history[key] = retained
+        indexes = {field: self._trim_postings(index, floor)
+                   for field, index in self._indexes.items()}
+        # Filter the existing ordered domains, rather than reconstructing from
+        # equality keys (equal cross-type numeric keys may share a posting).
+        ranges = {field: {domain: [v for v in values if v in indexes[field]]
+                          for domain, values in groups.items()}
+                  for field, groups in self._range_indexes.items()}
+        composites = {fields: self._trim_postings(index, floor)
+                      for fields, index in self._composite_indexes.items()}
+        times = self._times[floor - self._oldest_revision:]
+        self._history, self._indexes = history, indexes
+        self._range_indexes, self._composite_indexes = ranges, composites
+        self._times, self._oldest_revision = times, floor
 
     @property
     def revision(self):
@@ -251,7 +347,7 @@ class ChronoDict(MutableMapping):
             if self._track_mutations:
                 cls = _TrackedDict if type(value) is dict else _TrackedList if type(value) is list else None
                 if cls is not None:
-                    return cls(self, key, (), self._history[key][-1][0])
+                    return cls(self, key, (), self._key_revisions[key])
             return deepcopy(value)
 
     @staticmethod
@@ -272,7 +368,8 @@ class ChronoDict(MutableMapping):
         Payloads contain only internally owned, structurally shared branches.
         """
         if (shareable and type(old) is dict and type(new) is dict
-                and len(records) % _CHECKPOINT_INTERVAL != 0
+                and bool(records)
+                and not all(record[2] for record in records[-(_CHECKPOINT_INTERVAL - 1):])
                 and len(old) == len(new)
                 and all(a is b for a, b in zip(old, new))):
             changes = tuple((key, value) for key, value in new.items()
@@ -333,10 +430,13 @@ class ChronoDict(MutableMapping):
             self._history.setdefault(key, []).append(record)
             if deleted:
                 del self._data[key]
+                self._key_revisions.pop(key, None)
             else:
                 self._data[key] = new
+                self._key_revisions[key] = revision
             self._revision = revision
             self._times.append(timestamp)
+            self._prune_policy(timestamp)
 
     def __setitem__(self, key, value):
         self._commit(key, value)
@@ -368,6 +468,8 @@ class ChronoDict(MutableMapping):
             return self._revision
         if type(revision) is not int or not 0 <= revision <= self._revision:
             raise ValueError('Invalid revision')
+        if revision < self._oldest_revision:
+            raise ValueError('Revision is no longer retained')
         return revision
 
     def revision_at(self, timestamp):
@@ -382,12 +484,14 @@ class ChronoDict(MutableMapping):
             raise ValueError('timestamp must be timezone-aware')
         timestamp = timestamp.astimezone(timezone.utc)
         with self._lock:
-            return max(0, bisect_right(self._times, timestamp) - 1)
+            if self._oldest_revision and timestamp < self._times[0]:
+                raise ValueError('Timestamp is no longer retained')
+            return self._oldest_revision + max(0, bisect_right(self._times, timestamp) - 1)
 
     def timestamp(self, version=None):
         """Return the UTC timestamp of a revision (default: latest)."""
         with self._lock:
-            return self._times[self._validate_revision(version)]
+            return self._times[self._validate_revision(version) - self._oldest_revision]
 
     def _resolve_revision(self, version, at):
         """Resolve a revision number or timestamp, never both."""
@@ -438,7 +542,7 @@ class ChronoDict(MutableMapping):
 
     def history(self, key):
         with self._lock:
-            return [{'version': r, 'timestamp': self._times[r], 'deleted': v is _MISSING,
+            return [{'version': r, 'timestamp': self._times[r - self._oldest_revision], 'deleted': v is _MISSING,
                      'value': None if v is _MISSING else deepcopy(v)}
                     for r, v in self._iter_history(self._history.get(key, ()))]
 
