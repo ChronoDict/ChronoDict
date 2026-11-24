@@ -46,8 +46,8 @@ Phase	Development scope	                               Status
 
 5	    Performance benchmarking	                                Working
         5.1	Standard Python dict performance comparison             Completed
-        5.2	OrderedDict and defaultdict comparison                  Working
-        5.3	Pandas and alternative temporal storage comparison
+        5.2	OrderedDict and defaultdict comparison                  Completed
+        5.3	Pandas and alternative temporal storage comparison      Working
         5.4	Large-scale dataset benchmarking
         5.5	CPU and memory profiling
         5.6	Performance optimization and final benchmark report        
