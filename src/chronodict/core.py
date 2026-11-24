@@ -145,6 +145,43 @@ class ChronoDict(MutableMapping):
                     result[key] = deepcopy(value)
             return result
 
+    @property
+    def indexed_fields(self):
+        """Return indexed field names in creation order."""
+        with self._lock:
+            return tuple(self._indexes)
+
+    def create_index(self, field):
+        """Build an equality index across all retained revisions atomically.
+
+        An unhashable historical field value rejects the entire operation.
+        Index configuration does not create a data revision.
+        """
+        if not isinstance(field, str) or not field:
+            raise ValueError('Index field must be a non-empty string')
+        with self._lock:
+            if field in self._indexes:
+                raise ValueError(f'Index already exists: {field}')
+            index = {}
+            for key, records in self._history.items():
+                before = _MISSING
+                for revision, value in records:
+                    after = self._field(value, field)
+                    if before is after or (before is not _MISSING and
+                                           after is not _MISSING and before == after):
+                        continue
+                    if before is not _MISSING:
+                        index[before][key][-1][1] = revision
+                    if after is not _MISSING:
+                        index.setdefault(after, {}).setdefault(key, []).append([revision, None])
+                    before = after
+            self._indexes[field] = index
+
+    def drop_index(self, field):
+        """Remove an index without changing values or revision history."""
+        with self._lock:
+            del self._indexes[field]
+
     def rollback(self, key, *, version):
         """Restore a key at a revision, recording a new revision."""
         with self._lock:

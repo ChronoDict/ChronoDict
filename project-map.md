@@ -19,7 +19,7 @@ Historical point lookup uses binary search over key revisions. Indexed equality 
 ## Development Roadmap
 Phase	Development scope	                            Status
 1	    Core dictionary implementation	                Implemented
-2	    Advanced indexing and mutation tracking	        Pending
+2	    Advanced indexing and mutation tracking	        working
 3	    Memory optimization and delta compression	    Pending
 4	    Transactions and concurrency	                Pending
 5	    Performance benchmarking	                    Pending
