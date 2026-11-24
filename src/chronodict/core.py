@@ -20,6 +20,22 @@ _RANGE_OPS = {"gt": gt, "gte": ge, "lt": lt, "lte": le}
 _SHAREABLE_SCALARS = (type(None), bool, int, float, complex, str, bytes)
 
 
+def _flat_scalar_dict(value):
+    """Recognize exact dicts whose keys and values are immutable builtins."""
+    return type(value) is dict and all(
+        type(k) in _SHAREABLE_SCALARS and type(v) in _SHAREABLE_SCALARS
+        for k, v in value.items())
+
+
+def _copy_value(value):
+    """Detach simple values without recursive deepcopy; preserve all other semantics."""
+    if type(value) in _SHAREABLE_SCALARS:
+        return value
+    if _flat_scalar_dict(value):
+        return value.copy()
+    return deepcopy(value)
+
+
 def _plain_tree(value):
     """Check that a value has no custom objects or mutable alias topology."""
     seen = set()
@@ -123,7 +139,7 @@ class _Tracked:
             cls = _TrackedDict if type(value) is dict else _TrackedList if type(value) is list else None
             if cls is not None:
                 return cls(self._owner, self._key, self._path + (part,), self._revision)
-            return deepcopy(value)
+            return _copy_value(value)
 
     def __deepcopy__(self, memo):
         with self._owner._lock:
@@ -403,7 +419,7 @@ class ChronoDict(MutableMapping):
 
     @staticmethod
     def _field(value, field):
-        if isinstance(value, Mapping) and field in value:
+        if (type(value) is dict or isinstance(value, Mapping)) and field in value:
             result = value[field]
             hash(result)  # indexed attributes must be hashable
             return result
@@ -454,7 +470,7 @@ class ChronoDict(MutableMapping):
             if deleted and key not in self._data:
                 raise KeyError(key)
             old = self._data.get(key, _MISSING)
-            new = _MISSING if deleted else value if _owned else deepcopy(value)
+            new = _MISSING if deleted else value if _owned else _copy_value(value)
             shareable = (not deleted and old is not _MISSING
                          and _plain_tree(old) and _plain_tree(new))
             if shareable:
@@ -674,7 +690,7 @@ class ChronoDict(MutableMapping):
         with self._lock:
             revision = self._resolve_revision(version, at)
             value = self._at(key, revision)
-            return default if value is _MISSING else deepcopy(value)
+            return default if value is _MISSING else _copy_value(value)
 
     def patch(self, key, **changes):
         """Apply top-level field changes as one revision."""
@@ -686,7 +702,7 @@ class ChronoDict(MutableMapping):
             # incoming fields, then transfer ownership of the new root.
             if type(self) is ChronoDict and type(current) is dict and _plain_tree(current) and _plain_tree(changes):
                 value = current.copy()
-                value.update(deepcopy(changes))
+                value.update(_copy_value(changes))
                 self._commit(key, value, _owned=True)
             else:
                 # Preserve deepcopy and subclass dispatch for arbitrary objects.
@@ -785,12 +801,12 @@ class ChronoDict(MutableMapping):
 
     @staticmethod
     def _matches(value, field, op, target):
-        if not isinstance(value, Mapping) or field not in value:
+        if (type(value) is not dict and not isinstance(value, Mapping)) or field not in value:
             return False
         actual = value[field]
         if op is None:
             # Do not expose owned mutable branches to a query object's __eq__.
-            return deepcopy(actual) == target
+            return _copy_value(actual) == target
         return (_ordered_value(actual) == _ordered_value(target)
                 and _RANGE_OPS[op](actual, target))
 
@@ -841,7 +857,7 @@ class ChronoDict(MutableMapping):
                 if value is not _MISSING and all(
                         self._matches(value, field, op, target)
                         for field, op, target in predicates):
-                    result[key] = deepcopy(value)
+                    result[key] = _copy_value(value)
             return result
 
     @property
