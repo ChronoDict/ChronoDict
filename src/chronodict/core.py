@@ -713,10 +713,22 @@ class ChronoDict(MutableMapping):
                     for r, v in self._iter_history(self._history.get(key, ()))]
 
     def snapshot(self, version=None, *, at=None):
+        """Capture one committed revision, then copy safe trees outside the lock.
+
+        Captured roots remain alive even if retention prunes their revisions.
+        Custom objects and aliased or cyclic containers retain locked copying.
+        """
         with self._lock:
             revision = self._resolve_revision(version, at)
-            return {k: deepcopy(v) for k in self._history
-                    if (v := self._at(k, revision)) is not _MISSING}
+            captured = []
+            for key in self._history:
+                value = self._at(key, revision)
+                if value is _MISSING:
+                    continue
+                deferred = _plain_tree(value)
+                captured.append((key, value if deferred else deepcopy(value), deferred))
+        return {key: deepcopy(value) if deferred else value
+                for key, value, deferred in captured}
 
     @staticmethod
     def _add_range_value(groups, value):
