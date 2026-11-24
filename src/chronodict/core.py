@@ -1,12 +1,15 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing and copy-efficient updates."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates and bounded delta history."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
 from copy import deepcopy
 from threading import RLock
+from sys import getsizeof
 from datetime import datetime, timezone
 
 _MISSING = object()
+# Per-key checkpoint cadence bounds historical replay to 31 deltas.
+_CHECKPOINT_INTERVAL = 32
 _RANGE_OPS = {"gt": gt, "gte": ge, "lt": lt, "lte": le}
 
 
@@ -259,6 +262,39 @@ class ChronoDict(MutableMapping):
             return result
         return _MISSING
 
+    @staticmethod
+    def _history_record(records, revision, old, new, shareable):
+        """Encode sparse top-level replacements only when smaller than a snapshot.
+
+        Records are (revision, payload, is_delta). Full checkpoints cover all
+        unsupported shapes, deletes, key-order changes and periodic boundaries.
+        Identity comparisons preserve exact scalar values and key identities.
+        Payloads contain only internally owned, structurally shared branches.
+        """
+        if (shareable and type(old) is dict and type(new) is dict
+                and len(records) % _CHECKPOINT_INTERVAL != 0
+                and len(old) == len(new)
+                and all(a is b for a, b in zip(old, new))):
+            changes = tuple((key, value) for key, value in new.items()
+                            if old[key] is not value)
+            if getsizeof(changes) + sum(map(getsizeof, changes)) < getsizeof(new):
+                return revision, changes, True
+        return revision, new, False
+
+    @staticmethod
+    def _apply_delta(value, changes):
+        """Reconstruct an owned root without modifying the preceding revision."""
+        result = value.copy()
+        result.update(changes)
+        return result
+
+    def _iter_history(self, records):
+        """Decode a key's history in one forward pass for index rebuilding."""
+        value = _MISSING
+        for revision, payload, is_delta in records:
+            value = self._apply_delta(value, payload) if is_delta else payload
+            yield revision, value
+
     def _commit(self, key, value, deleted=False, *, _owned=False):
         """Commit a revision; _owned is reserved for internal plain-tree updates."""
         hash(key)
@@ -267,7 +303,9 @@ class ChronoDict(MutableMapping):
                 raise KeyError(key)
             old = self._data.get(key, _MISSING)
             new = _MISSING if deleted else value if _owned else deepcopy(value)
-            if not deleted and old is not _MISSING and _plain_tree(old) and _plain_tree(new):
+            shareable = (not deleted and old is not _MISSING
+                         and _plain_tree(old) and _plain_tree(new))
+            if shareable:
                 new = _share_tree(old, new)
             # Validate and prepare before changing state.
             transitions = [(field, self._field(old, field), self._field(new, field))
@@ -278,6 +316,8 @@ class ChronoDict(MutableMapping):
             revision = self._revision + 1
             # Keep the revision timeline sorted even if the system clock moves backward.
             timestamp = max(self._times[-1], datetime.now(timezone.utc))
+            record = self._history_record(self._history.get(key, ()), revision,
+                                          old, new, shareable)
             for field, before, after in transitions:
                 if after is not _MISSING:
                     self._add_range_value(self._range_indexes[field], after)
@@ -290,7 +330,7 @@ class ChronoDict(MutableMapping):
                     index.setdefault(after, {}).setdefault(key, []).append([revision, None])
             for fields, before, after in composite_transitions:
                 self._transition(self._composite_indexes[fields], key, revision, before, after)
-            self._history.setdefault(key, []).append((revision, new))
+            self._history.setdefault(key, []).append(record)
             if deleted:
                 del self._data[key]
             else:
@@ -360,7 +400,17 @@ class ChronoDict(MutableMapping):
     def _at(self, key, revision):
         records = self._history.get(key, ())
         pos = bisect_right(records, revision, key=lambda record: record[0]) - 1
-        return records[pos][1] if pos >= 0 else _MISSING
+        if pos < 0:
+            return _MISSING
+        if pos == len(records) - 1:
+            return self._data.get(key, _MISSING)
+        start = pos
+        while records[start][2]:
+            start -= 1
+        value = records[start][1]
+        for i in range(start + 1, pos + 1):
+            value = self._apply_delta(value, records[i][1])
+        return value
 
     def get(self, key, default=None, *, version=None, at=None):
         with self._lock:
@@ -390,7 +440,7 @@ class ChronoDict(MutableMapping):
         with self._lock:
             return [{'version': r, 'timestamp': self._times[r], 'deleted': v is _MISSING,
                      'value': None if v is _MISSING else deepcopy(v)}
-                    for r, v in self._history.get(key, ())]
+                    for r, v in self._iter_history(self._history.get(key, ()))]
 
     def snapshot(self, version=None, *, at=None):
         with self._lock:
@@ -516,7 +566,7 @@ class ChronoDict(MutableMapping):
             ranges = {}
             for key, records in self._history.items():
                 before = _MISSING
-                for revision, value in records:
+                for revision, value in self._iter_history(records):
                     after = self._field(value, field)
                     if after is not _MISSING:
                         self._add_range_value(ranges, after)
@@ -581,7 +631,7 @@ class ChronoDict(MutableMapping):
             index = {}
             for key, records in self._history.items():
                 before = _MISSING
-                for revision, value in records:
+                for revision, value in self._iter_history(records):
                     after = self._composite_value(value, fields)
                     self._transition(index, key, revision, before, after)
                     before = after

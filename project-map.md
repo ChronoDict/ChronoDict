@@ -31,8 +31,8 @@ Phase	Development scope	                            Status
 3	    Memory optimization and delta compression	    Pending
 
         3.1	Structural sharing	                        Completed
-        3.2	Eliminate redundant deep copies	            working
-        3.3	Delta-based revision storage	            Pending
+        3.2	Eliminate redundant deep copies	            Completed
+        3.3	Delta-based revision storage	            Working
         3.4	Configurable history retention	            Pending
         3.5	History compaction and garbage collection	Pending
         3.6	Memory benchmarking and regression testing	Pending
