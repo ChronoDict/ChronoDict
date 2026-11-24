@@ -223,6 +223,7 @@ class ChronoDict(MutableMapping):
 
     def __init__(self, data=None, *, indexes=(), track_mutations=True, max_revisions=None, max_age=None):
         self._lock = RLock()
+        self._atomic_callback = False
         self._transaction_active = False
         self._transaction_stage = False
         self._track_mutations = track_mutations
@@ -445,6 +446,8 @@ class ChronoDict(MutableMapping):
         """Commit a revision; _owned is reserved for internal plain-tree updates."""
         hash(key)
         with self._lock:
+            if self._atomic_callback:
+                raise RuntimeError("Writes from an atomic update callback are not supported")
             if self._transaction_active:
                 raise RuntimeError("Write through the transaction mapping")
             if deleted and key not in self._data:
@@ -493,7 +496,7 @@ class ChronoDict(MutableMapping):
 
     def _check_transaction_configuration(self):
         """Keep index definitions and retention fixed during a transaction."""
-        if self._transaction_active or self._transaction_stage:
+        if self._atomic_callback or self._transaction_active or self._transaction_stage:
             raise RuntimeError("Configuration changes are not transactional")
 
     @staticmethod
@@ -531,7 +534,7 @@ class ChronoDict(MutableMapping):
         Publication and retention run under the owner lock.
         """
         with self._lock:
-            if self._transaction_active or self._transaction_stage:
+            if self._atomic_callback or self._transaction_active or self._transaction_stage:
                 raise RuntimeError("Nested or concurrent transactions are not supported")
             self._transaction_active = True
         try:
@@ -673,6 +676,35 @@ class ChronoDict(MutableMapping):
                 value = deepcopy(current)
                 value.update(changes)
                 self[key] = value
+
+    def atomic_update(self, key, transform):
+        """Replace an existing value using a serialized read-modify-write.
+
+        The callback receives a detached copy and returns the replacement.
+        It may read this mapping but must not mutate it or wait for another
+        thread accessing it. Callback exceptions leave the mapping unchanged.
+        """
+        if not callable(transform):
+            raise TypeError('transform must be callable')
+        with self._lock:
+            if self._transaction_active or self._atomic_callback:
+                raise RuntimeError('Atomic update is not available during this operation')
+            self._atomic_callback = True
+            try:
+                replacement = transform(deepcopy(self._data[key]))
+                # Prepare the detached return value before committing.
+                result = deepcopy(replacement)
+            finally:
+                self._atomic_callback = False
+            self[key] = replacement
+            return result
+
+    def setdefault(self, key, default=None):
+        """Insert a missing key exactly once, even with competing threads."""
+        with self._lock:
+            if key not in self._data:
+                self[key] = default
+            return self[key]
 
     def history(self, key):
         with self._lock:

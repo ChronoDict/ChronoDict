@@ -37,8 +37,8 @@ Phase	Development scope	                            Status
 
 4	    Transactions and concurrency	                    Working
         4.1	Atomic transactions	                                Completed
-        4.2	Transaction isolation	                            Working
-        4.3	Concurrent read and write operations	            Pending
+        4.2	Transaction isolation	                            Completed
+        4.3	Concurrent read and write operations	            Working
         4.4	Concurrent historical snapshots	                    Pending
         4.5	Conflict detection and resolution	                Pending
         4.6	Concurrency benchmarking and comprehensive testing	Pending
