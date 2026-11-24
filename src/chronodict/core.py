@@ -1,4 +1,4 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval and conservative structural sharing."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing and copy-efficient updates."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
@@ -121,7 +121,8 @@ class _Tracked:
             return deepcopy(value)
 
     def __deepcopy__(self, memo):
-        return deepcopy(self._read(), memo)
+        with self._owner._lock:
+            return deepcopy(self._node(self._root()), memo)
 
     def __repr__(self):
         return repr(self._read())
@@ -130,7 +131,8 @@ class _Tracked:
         return self._read() == (other._read() if isinstance(other, _Tracked) else other)
 
     def __len__(self):
-        return len(self._read())
+        with self._owner._lock:
+            return len(self._node(self._root()))
 
     def __getitem__(self, key):
         return self._child(key)
@@ -257,13 +259,14 @@ class ChronoDict(MutableMapping):
             return result
         return _MISSING
 
-    def _commit(self, key, value, deleted=False):
+    def _commit(self, key, value, deleted=False, *, _owned=False):
+        """Commit a revision; _owned is reserved for internal plain-tree updates."""
         hash(key)
         with self._lock:
             if deleted and key not in self._data:
                 raise KeyError(key)
             old = self._data.get(key, _MISSING)
-            new = _MISSING if deleted else deepcopy(value)
+            new = _MISSING if deleted else value if _owned else deepcopy(value)
             if not deleted and old is not _MISSING and _plain_tree(old) and _plain_tree(new):
                 new = _share_tree(old, new)
             # Validate and prepare before changing state.
@@ -368,11 +371,20 @@ class ChronoDict(MutableMapping):
     def patch(self, key, **changes):
         """Apply top-level field changes as one revision."""
         with self._lock:
-            value = deepcopy(self._data[key])
-            if not isinstance(value, dict):
+            current = self._data[key]
+            if not isinstance(current, dict):
                 raise TypeError('patch requires a dict value')
-            value.update(changes)
-            self[key] = value
+            # Plain trees can safely share untouched branches. Copy only the
+            # incoming fields, then transfer ownership of the new root.
+            if type(self) is ChronoDict and type(current) is dict and _plain_tree(current) and _plain_tree(changes):
+                value = current.copy()
+                value.update(deepcopy(changes))
+                self._commit(key, value, _owned=True)
+            else:
+                # Preserve deepcopy and subclass dispatch for arbitrary objects.
+                value = deepcopy(current)
+                value.update(changes)
+                self[key] = value
 
     def history(self, key):
         with self._lock:
