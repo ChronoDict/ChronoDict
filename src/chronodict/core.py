@@ -1,4 +1,4 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
@@ -213,6 +213,8 @@ class ChronoDict(MutableMapping):
                                       self._composite_value(new, fields))
                                      for fields in self._composite_indexes]
             revision = self._revision + 1
+            # Keep the revision timeline sorted even if the system clock moves backward.
+            timestamp = max(self._times[-1], datetime.now(timezone.utc))
             for field, before, after in transitions:
                 if after is not _MISSING:
                     self._add_range_value(self._range_indexes[field], after)
@@ -231,7 +233,7 @@ class ChronoDict(MutableMapping):
             else:
                 self._data[key] = new
             self._revision = revision
-            self._times.append(datetime.now(timezone.utc))
+            self._times.append(timestamp)
 
     def __setitem__(self, key, value):
         self._commit(key, value)
@@ -265,14 +267,41 @@ class ChronoDict(MutableMapping):
             raise ValueError('Invalid revision')
         return revision
 
+    def revision_at(self, timestamp):
+        """Return the latest revision at or before an aware datetime.
+
+        Before construction, the dictionary is treated as empty (revision 0).
+        Equal commit timestamps resolve to the latest matching revision.
+        """
+        if not isinstance(timestamp, datetime):
+            raise TypeError('timestamp must be a datetime')
+        if timestamp.utcoffset() is None:
+            raise ValueError('timestamp must be timezone-aware')
+        timestamp = timestamp.astimezone(timezone.utc)
+        with self._lock:
+            return max(0, bisect_right(self._times, timestamp) - 1)
+
+    def timestamp(self, version=None):
+        """Return the UTC timestamp of a revision (default: latest)."""
+        with self._lock:
+            return self._times[self._validate_revision(version)]
+
+    def _resolve_revision(self, version, at):
+        """Resolve a revision number or timestamp, never both."""
+        if at is not None:
+            if version is not None:
+                raise ValueError('Specify either version or at, not both')
+            return self.revision_at(at)
+        return self._validate_revision(version)
+
     def _at(self, key, revision):
         records = self._history.get(key, ())
         pos = bisect_right(records, revision, key=lambda record: record[0]) - 1
         return records[pos][1] if pos >= 0 else _MISSING
 
-    def get(self, key, default=None, *, version=None):
+    def get(self, key, default=None, *, version=None, at=None):
         with self._lock:
-            revision = self._validate_revision(version)
+            revision = self._resolve_revision(version, at)
             value = self._at(key, revision)
             return default if value is _MISSING else deepcopy(value)
 
@@ -291,9 +320,9 @@ class ChronoDict(MutableMapping):
                      'value': None if v is _MISSING else deepcopy(v)}
                     for r, v in self._history.get(key, ())]
 
-    def snapshot(self, version=None):
+    def snapshot(self, version=None, *, at=None):
         with self._lock:
-            revision = self._validate_revision(version)
+            revision = self._resolve_revision(version, at)
             return {k: deepcopy(v) for k in self._history
                     if (v := self._at(k, revision)) is not _MISSING}
 
@@ -343,7 +372,7 @@ class ChronoDict(MutableMapping):
         return (_ordered_value(actual) == _ordered_value(target)
                 and _RANGE_OPS[op](actual, target))
 
-    def find(self, *, version=None, **conditions):
+    def find(self, *, version=None, at=None, **conditions):
         """Search current or historical values using equality and scalar ranges.
 
         Range suffixes: __gt, __gte, __lt, __lte. Incompatible scalar
@@ -351,7 +380,7 @@ class ChronoDict(MutableMapping):
         An explicitly indexed literal field name takes precedence over a suffix.
         """
         with self._lock:
-            revision = self._validate_revision(version)
+            revision = self._resolve_revision(version, at)
             candidates = None
             predicates = []
             for expression, target in conditions.items():
@@ -491,20 +520,24 @@ class ChronoDict(MutableMapping):
         with self._lock:
             del self._composite_indexes[fields]
 
-    def rollback(self, key, *, version):
+    def rollback(self, key, *, version=None, at=None):
         """Restore a key at a revision, recording a new revision."""
         with self._lock:
-            value = self._at(key, self._validate_revision(version))
+            if version is None and at is None:
+                raise ValueError('Specify version or at for rollback')
+            value = self._at(key, self._resolve_revision(version, at))
             if value is _MISSING:
                 if key in self._data:
                     del self[key]
             else:
                 self[key] = value
 
-    def diff(self, key, *, from_version, to_version):
+    def diff(self, key, *, from_version=None, to_version=None, from_at=None, to_at=None):
         with self._lock:
-            before = self._at(key, self._validate_revision(from_version))
-            after = self._at(key, self._validate_revision(to_version))
+            if (from_version is None and from_at is None) or (to_version is None and to_at is None):
+                raise ValueError('Specify both comparison endpoints')
+            before = self._at(key, self._resolve_revision(from_version, from_at))
+            after = self._at(key, self._resolve_revision(to_version, to_at))
             return {'before_exists': before is not _MISSING, 'after_exists': after is not _MISSING,
                     'before': None if before is _MISSING else deepcopy(before),
                     'after': None if after is _MISSING else deepcopy(after)}
