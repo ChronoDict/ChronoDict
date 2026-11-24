@@ -29,7 +29,8 @@ class ChronoDictTests(unittest.TestCase):
         self.d[3] = value
         value['nested'].append(1)
         self.d[3]['nested'].append(2)
-        self.assertEqual(self.d[3]['nested'], [])
+        self.assertEqual(self.d[3]['nested'], [2])
+        self.assertEqual(self.d.get(3, version=3)['nested'], [])
 
     def test_snapshot_diff(self):
         self.d.patch(1, salary=80)

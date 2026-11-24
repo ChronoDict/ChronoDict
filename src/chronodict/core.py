@@ -1,6 +1,6 @@
 """In-memory versioned mapping with temporal equality and range indexes."""
 from bisect import bisect_left, bisect_right
-from collections.abc import MutableMapping, Mapping
+from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
 from copy import deepcopy
 from threading import RLock
@@ -21,11 +21,144 @@ def _ordered_value(value):
     return None
 
 
-class ChronoDict(MutableMapping):
-    """Revisioned mapping. Values are copied on input and output to prevent untracked mutations."""
+class _Tracked:
+    """A revision-bound live view; stale writes are rejected, never rebased."""
 
-    def __init__(self, data=None, *, indexes=()):
+    def __init__(self, owner, key, path, revision):
+        self._owner = owner
+        self._key = key
+        self._path = path
+        self._revision = revision
+
+    def _node(self, root):
+        for part in self._path:
+            root = root[part]
+        return root
+
+    def _root(self):
+        records = self._owner._history.get(self._key, ())
+        if not records or records[-1][0] != self._revision or self._key not in self._owner._data:
+            raise RuntimeError('Stale ChronoDict view; retrieve the key again')
+        return self._owner._data[self._key]
+
+    def _read(self):
+        with self._owner._lock:
+            return deepcopy(self._node(self._root()))
+
+    def _change(self, operation):
+        with self._owner._lock:
+            root = deepcopy(self._root())
+            result = operation(self._node(root))
+            self._root()  # Reject reentrant changes during callbacks.
+            self._owner._commit(self._key, root)
+            self._revision = self._owner._revision
+            return result
+
+    def _child(self, part):
+        with self._owner._lock:
+            value = self._node(self._root())[part]
+            cls = _TrackedDict if type(value) is dict else _TrackedList if type(value) is list else None
+            if cls is not None:
+                return cls(self._owner, self._key, self._path + (part,), self._revision)
+            return deepcopy(value)
+
+    def __deepcopy__(self, memo):
+        return deepcopy(self._read(), memo)
+
+    def __repr__(self):
+        return repr(self._read())
+
+    def __eq__(self, other):
+        return self._read() == (other._read() if isinstance(other, _Tracked) else other)
+
+    def __len__(self):
+        return len(self._read())
+
+    def __getitem__(self, key):
+        return self._child(key)
+
+    def __setitem__(self, key, value):
+        self._change(lambda node: node.__setitem__(key, deepcopy(value)))
+
+    def __delitem__(self, key):
+        self._change(lambda node: node.__delitem__(key))
+
+
+class _TrackedDict(_Tracked, MutableMapping):
+    """Dictionary view with atomic mutation methods."""
+
+    def __iter__(self):
+        return iter(self._read())
+
+    def update(self, *args, **kwargs):
+        changes = deepcopy(dict(*args, **kwargs))
+        self._change(lambda node: node.update(changes))
+
+    def clear(self):
+        self._change(lambda node: node.clear())
+
+    def pop(self, key, *default):
+        return self._change(lambda node: node.pop(key, *default))
+
+    def popitem(self):
+        return self._change(lambda node: node.popitem())
+
+    def setdefault(self, key, default=None):
+        with self._owner._lock:
+            if key not in self._node(self._root()):
+                self[key] = default
+            return self[key]
+
+    def copy(self):
+        return self._read()
+
+
+class _TrackedList(_Tracked, MutableSequence):
+    """List view with atomic mutation methods; slices return detached copies."""
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return self._read()[key]
+        return self._child(key)
+
+    def __iter__(self):
+        return iter(self._read())
+
+    def insert(self, index, value):
+        self._change(lambda node: node.insert(index, deepcopy(value)))
+
+    def append(self, value):
+        self._change(lambda node: node.append(deepcopy(value)))
+
+    def extend(self, values):
+        values = deepcopy(list(values))
+        self._change(lambda node: node.extend(values))
+
+    def pop(self, index=-1):
+        return self._change(lambda node: node.pop(index))
+
+    def remove(self, value):
+        self._change(lambda node: node.remove(value))
+
+    def clear(self):
+        self._change(lambda node: node.clear())
+
+    def reverse(self):
+        self._change(lambda node: node.reverse())
+
+    def sort(self, *, key=None, reverse=False):
+        self._change(lambda node: node.sort(key=key, reverse=reverse))
+
+    def copy(self):
+        return self._read()
+
+
+class ChronoDict(MutableMapping):
+    """Revisioned mapping with optional live nested dict/list mutation tracking."""
+
+    def __init__(self, data=None, *, indexes=(), track_mutations=True):
         self._lock = RLock()
+        self._track_mutations = track_mutations
         self._data = {}
         self._history = {}
         self._indexes = {field: {} for field in indexes}
@@ -50,7 +183,12 @@ class ChronoDict(MutableMapping):
 
     def __getitem__(self, key):
         with self._lock:
-            return deepcopy(self._data[key])
+            value = self._data[key]
+            if self._track_mutations:
+                cls = _TrackedDict if type(value) is dict else _TrackedList if type(value) is list else None
+                if cls is not None:
+                    return cls(self, key, (), self._history[key][-1][0])
+            return deepcopy(value)
 
     @staticmethod
     def _field(value, field):
@@ -95,6 +233,25 @@ class ChronoDict(MutableMapping):
     def __delitem__(self, key):
         self._commit(key, None, deleted=True)
 
+    def pop(self, key, *default):
+        if len(default) > 1:
+            raise TypeError('pop expected at most two arguments')
+        with self._lock:
+            if key not in self._data:
+                if default:
+                    return default[0]
+                raise KeyError(key)
+            value = deepcopy(self._data[key])
+            del self[key]
+            return value
+
+    def popitem(self):
+        with self._lock:
+            if not self._data:
+                raise KeyError('ChronoDict is empty')
+            key = next(reversed(self._data))
+            return key, self.pop(key)
+
     def _validate_revision(self, revision):
         if revision is None:
             return self._revision
@@ -116,7 +273,7 @@ class ChronoDict(MutableMapping):
     def patch(self, key, **changes):
         """Apply top-level field changes as one revision."""
         with self._lock:
-            value = self[key]
+            value = deepcopy(self._data[key])
             if not isinstance(value, dict):
                 raise TypeError('patch requires a dict value')
             value.update(changes)
