@@ -1,4 +1,4 @@
-"""In-memory versioned mapping with temporal equality and range indexes."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
@@ -163,6 +163,7 @@ class ChronoDict(MutableMapping):
         self._history = {}
         self._indexes = {field: {} for field in indexes}
         self._range_indexes = {field: {} for field in self._indexes}
+        self._composite_indexes = {}
         self._revision = 0
         self._times = [datetime.now(timezone.utc)]
         if data is not None:
@@ -208,6 +209,9 @@ class ChronoDict(MutableMapping):
             # Validate and prepare before changing state.
             transitions = [(field, self._field(old, field), self._field(new, field))
                            for field in self._indexes]
+            composite_transitions = [(fields, self._composite_value(old, fields),
+                                      self._composite_value(new, fields))
+                                     for fields in self._composite_indexes]
             revision = self._revision + 1
             for field, before, after in transitions:
                 if after is not _MISSING:
@@ -219,6 +223,8 @@ class ChronoDict(MutableMapping):
                     index[before][key][-1][1] = revision
                 if after is not _MISSING:
                     index.setdefault(after, {}).setdefault(key, []).append([revision, None])
+            for fields, before, after in composite_transitions:
+                self._transition(self._composite_indexes[fields], key, revision, before, after)
             self._history.setdefault(key, []).append((revision, new))
             if deleted:
                 del self._data[key]
@@ -350,12 +356,24 @@ class ChronoDict(MutableMapping):
             predicates = []
             for expression, target in conditions.items():
                 field, sep, op = expression.rpartition('__')
-                if expression in self._indexes or not sep or op not in _RANGE_OPS:
+                if (expression in self._indexes or
+                        any(expression in fields for fields in self._composite_indexes)
+                        or not sep or op not in _RANGE_OPS):
                     field, op = expression, None
                 elif _ordered_value(target) is None:
                     raise TypeError('Unsupported range target')
                 predicates.append((field, op, target))
-                if field not in self._indexes:
+            equality = {field: target for field, op, target in predicates if op is None}
+            covered = set()
+            for fields, index in sorted(self._composite_indexes.items(),
+                                        key=lambda item: -len(item[0])):
+                if all(field in equality for field in fields) and not set(fields) <= covered:
+                    target = tuple(equality[field] for field in fields)
+                    matches = self._active_keys(index.get(target, {}), revision)
+                    candidates = matches if candidates is None else candidates & matches
+                    covered.update(fields)
+            for field, op, target in predicates:
+                if field not in self._indexes or (op is None and field in covered):
                     continue
                 index = self._indexes[field]
                 if op is None:
@@ -416,6 +434,62 @@ class ChronoDict(MutableMapping):
         with self._lock:
             del self._indexes[field]
             del self._range_indexes[field]
+
+    @staticmethod
+    def _normalize_composite(fields):
+        """Canonicalize an unordered collection of distinct field names."""
+        if len(fields) < 2 or any(not isinstance(f, str) or not f for f in fields):
+            raise ValueError('A composite index requires at least two non-empty field names')
+        if len(set(fields)) != len(fields):
+            raise ValueError('Composite index fields must be distinct')
+        return tuple(sorted(fields))
+
+    @staticmethod
+    def _composite_value(value, fields):
+        """Return a hashable tuple only when every field is present."""
+        if not isinstance(value, Mapping) or any(f not in value for f in fields):
+            return _MISSING
+        result = tuple(value[f] for f in fields)
+        hash(result)
+        return result
+
+    @staticmethod
+    def _transition(index, key, revision, before, after):
+        """Close and open temporal postings when an indexed value changes."""
+        if before is after or (before is not _MISSING and after is not _MISSING
+                               and before == after):
+            return
+        if before is not _MISSING:
+            index[before][key][-1][1] = revision
+        if after is not _MISSING:
+            index.setdefault(after, {}).setdefault(key, []).append([revision, None])
+
+    @property
+    def composite_indexes(self):
+        """Return canonical field tuples in index creation order."""
+        with self._lock:
+            return tuple(self._composite_indexes)
+
+    def create_composite_index(self, *fields):
+        """Index complete field combinations across all retained revisions."""
+        fields = self._normalize_composite(fields)
+        with self._lock:
+            if fields in self._composite_indexes:
+                raise ValueError(f'Composite index already exists: {fields}')
+            index = {}
+            for key, records in self._history.items():
+                before = _MISSING
+                for revision, value in records:
+                    after = self._composite_value(value, fields)
+                    self._transition(index, key, revision, before, after)
+                    before = after
+            self._composite_indexes[fields] = index
+
+    def drop_composite_index(self, *fields):
+        """Remove a composite index without modifying data or history."""
+        fields = self._normalize_composite(fields)
+        with self._lock:
+            del self._composite_indexes[fields]
 
     def rollback(self, key, *, version):
         """Restore a key at a revision, recording a new revision."""

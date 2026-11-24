@@ -24,8 +24,8 @@ Phase	Development scope	                            Status
     2.1	Dynamic index creation and removal                 Completed
     2.2	Range-based indexing (gt, lt, gte, lte)	           Completed
     2.3	Nested mutation tracking	                       Completed
-    2.4	Composite indexes	                               working
-    2.5	Historical timestamp-based retrieval	           Pending
+    2.4	Composite indexes	                               Completed
+    2.5	Historical timestamp-based retrieval	           working
     2.6	Comprehensive regression testing	               Pending
 
 3	    Memory optimization and delta compression	    Pending
