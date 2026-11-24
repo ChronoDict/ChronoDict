@@ -1,4 +1,4 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval and conservative structural sharing."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
@@ -8,6 +8,64 @@ from datetime import datetime, timezone
 
 _MISSING = object()
 _RANGE_OPS = {"gt": gt, "gte": ge, "lt": lt, "lte": le}
+
+
+# Only exact built-in scalar leaves and unaliased dict/list trees are shared.
+# Arbitrary objects, cycles and repeated container references retain deepcopy semantics.
+_SHAREABLE_SCALARS = (type(None), bool, int, float, complex, str, bytes)
+
+
+def _plain_tree(value):
+    """Check that a value has no custom objects or mutable alias topology."""
+    seen = set()
+    pending = [value]
+    while pending:
+        node = pending.pop()
+        kind = type(node)
+        if kind in _SHAREABLE_SCALARS:
+            continue
+        if kind not in (dict, list) or id(node) in seen:
+            return False
+        seen.add(id(node))
+        if kind is dict:
+            if any(type(key) not in _SHAREABLE_SCALARS for key in node):
+                return False
+            pending.extend(node.values())
+        else:
+            pending.extend(node)
+    return True
+
+
+def _share_tree(old, new):
+    """Reuse unchanged branches of an owned, detached plain tree.
+
+    Identity checks on leaves preserve distinctions such as signed zero,
+    NaN and numeric types. Never mutate an earlier revision.
+    """
+    if old is new:
+        return old
+    if type(old) is not type(new):
+        return new
+    if type(new) is dict:
+        same = len(old) == len(new)
+        # Match only identical keys; preserve insertion order and key identity.
+        previous = {id(key): value for key, value in old.items()}
+        if same:
+            same = all(a is b for a, b in zip(old, new))
+        for key, value in new.items():
+            prior = previous.get(id(key), _MISSING)
+            shared = _share_tree(prior, value)
+            new[key] = shared
+            same = same and shared is prior
+        return old if same else new
+    if type(new) is list:
+        same = len(old) == len(new)
+        for i, value in enumerate(new):
+            prior = old[i] if i < len(old) else _MISSING
+            new[i] = _share_tree(prior, value)
+            same = same and new[i] is prior
+        return old if same else new
+    return new
 
 
 def _ordered_value(value):
@@ -206,6 +264,8 @@ class ChronoDict(MutableMapping):
                 raise KeyError(key)
             old = self._data.get(key, _MISSING)
             new = _MISSING if deleted else deepcopy(value)
+            if not deleted and old is not _MISSING and _plain_tree(old) and _plain_tree(new):
+                new = _share_tree(old, new)
             # Validate and prepare before changing state.
             transitions = [(field, self._field(old, field), self._field(new, field))
                            for field in self._indexes]
@@ -368,7 +428,8 @@ class ChronoDict(MutableMapping):
             return False
         actual = value[field]
         if op is None:
-            return actual == target
+            # Do not expose owned mutable branches to a query object's __eq__.
+            return deepcopy(actual) == target
         return (_ordered_value(actual) == _ordered_value(target)
                 and _RANGE_OPS[op](actual, target))
 
