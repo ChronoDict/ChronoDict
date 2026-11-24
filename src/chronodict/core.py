@@ -4,7 +4,7 @@ from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
 from copy import deepcopy
-from threading import RLock
+from threading import RLock, get_ident
 from sys import getsizeof
 from datetime import datetime, timezone, timedelta
 
@@ -225,6 +225,7 @@ class ChronoDict(MutableMapping):
         self._lock = RLock()
         self._atomic_callback = False
         self._transaction_active = False
+        self._optimistic_threads = set()
         self._transaction_stage = False
         self._track_mutations = track_mutations
         self._data = {}
@@ -496,7 +497,7 @@ class ChronoDict(MutableMapping):
 
     def _check_transaction_configuration(self):
         """Keep index definitions and retention fixed during a transaction."""
-        if self._atomic_callback or self._transaction_active or self._transaction_stage:
+        if self._atomic_callback or self._transaction_active or self._optimistic_threads or self._transaction_stage:
             raise RuntimeError("Configuration changes are not transactional")
 
     @staticmethod
@@ -525,20 +526,31 @@ class ChronoDict(MutableMapping):
         return candidate
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, optimistic=False):
         """Stage writes privately while other threads read committed state.
 
         Only one writer transaction may be active. Owner writes, competing
         transactions and configuration changes fail fast until it exits.
         The stage has a private revision timeline and remains detached on exit.
         Publication and retention run under the owner lock.
+        Optimistic mode permits concurrent writers but rejects a commit if
+        any owner revision changed since staging began. Retry in a fresh context.
         """
+        if type(optimistic) is not bool:
+            raise TypeError("optimistic must be a bool")
+        thread = get_ident()
         with self._lock:
-            if self._atomic_callback or self._transaction_active or self._transaction_stage:
-                raise RuntimeError("Nested or concurrent transactions are not supported")
-            self._transaction_active = True
+            if (self._atomic_callback or self._transaction_active or self._transaction_stage
+                    or thread in self._optimistic_threads
+                    or (not optimistic and self._optimistic_threads)):
+                raise RuntimeError("Nested or incompatible concurrent transactions are not supported")
+            if optimistic:
+                self._optimistic_threads.add(thread)
+            else:
+                self._transaction_active = True
         try:
             with self._lock:
+                base_revision = self._revision
                 stage = ChronoDict(track_mutations=self._track_mutations)
                 stage._data = {k: deepcopy(v) for k, v in self._data.items()}
                 stage._history = {k: [(0, v, False)] for k, v in stage._data.items()}
@@ -550,6 +562,8 @@ class ChronoDict(MutableMapping):
                 stage._transaction_stage = True
             yield stage
             with self._lock, stage._lock:
+                if optimistic and self._revision != base_revision:
+                    raise RuntimeError("Transaction conflict: committed revision changed; retry")
                 touched = [k for k, records in stage._history.items()
                            if records[-1][0] > 0 and
                            (k in stage._data or k in self._data)]
@@ -573,7 +587,10 @@ class ChronoDict(MutableMapping):
                     setattr(self, attr, getattr(candidate, attr))
         finally:
             with self._lock:
-                self._transaction_active = False
+                if optimistic:
+                    self._optimistic_threads.remove(thread)
+                else:
+                    self._transaction_active = False
 
     def __setitem__(self, key, value):
         self._commit(key, value)
