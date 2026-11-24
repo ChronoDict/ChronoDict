@@ -523,19 +523,19 @@ class ChronoDict(MutableMapping):
 
     @contextmanager
     def transaction(self):
-        """Yield an isolated writable mapping; commit its final changes as one revision.
+        """Stage writes privately while other threads read committed state.
 
-        Use the yielded mapping, not the owner, for writes and read-your-writes.
-        The owner exposes committed state and holds its lock until exit. Exceptions
-        escaping the block abort all staged changes. Nested transactions and index
-        or retention changes are unsupported. The staging mapping has a private
-        revision timeline and is detached from the owner after exit.
+        Only one writer transaction may be active. Owner writes, competing
+        transactions and configuration changes fail fast until it exits.
+        The stage has a private revision timeline and remains detached on exit.
+        Publication and retention run under the owner lock.
         """
         with self._lock:
             if self._transaction_active or self._transaction_stage:
-                raise RuntimeError("Nested transactions are not supported")
+                raise RuntimeError("Nested or concurrent transactions are not supported")
             self._transaction_active = True
-            try:
+        try:
+            with self._lock:
                 stage = ChronoDict(track_mutations=self._track_mutations)
                 stage._data = {k: deepcopy(v) for k, v in self._data.items()}
                 stage._history = {k: [(0, v, False)] for k, v in stage._data.items()}
@@ -545,30 +545,31 @@ class ChronoDict(MutableMapping):
                 for fields in self._composite_indexes:
                     stage.create_composite_index(*fields)
                 stage._transaction_stage = True
-                yield stage
-                with stage._lock:
-                    touched = [k for k, records in stage._history.items()
-                               if records[-1][0] > 0 and
-                               (k in stage._data or k in self._data)]
-                    if not touched:
-                        return
-                    candidate = self._transaction_candidate()
-                    revision = self._revision + 1
-                    timestamp = max(self._times[-1], datetime.now(timezone.utc))
-                    for key in touched:
-                        deleted = key not in stage._data
-                        candidate._commit(key, stage._data.get(key), deleted=deleted,
-                                          _batch=(revision, timestamp))
-                    # Preserve insertion order, including delete/reinsert sequences.
-                    candidate._data = {k: candidate._data[k] for k in stage._data}
-                    candidate._times.append(timestamp)
-                    candidate._prune_policy(timestamp)
-                    # Publish only after every validation and retention step succeeds.
-                    for attr in ('_data', '_history', '_key_revisions', '_revision',
-                                 '_oldest_revision', '_times', '_indexes',
-                                 '_composite_indexes', '_range_indexes'):
-                        setattr(self, attr, getattr(candidate, attr))
-            finally:
+            yield stage
+            with self._lock, stage._lock:
+                touched = [k for k, records in stage._history.items()
+                           if records[-1][0] > 0 and
+                           (k in stage._data or k in self._data)]
+                if not touched:
+                    return
+                candidate = self._transaction_candidate()
+                revision = self._revision + 1
+                timestamp = max(self._times[-1], datetime.now(timezone.utc))
+                for key in touched:
+                    deleted = key not in stage._data
+                    candidate._commit(key, stage._data.get(key), deleted=deleted,
+                                      _batch=(revision, timestamp))
+                # Preserve insertion order, including delete/reinsert sequences.
+                candidate._data = {k: candidate._data[k] for k in stage._data}
+                candidate._times.append(timestamp)
+                candidate._prune_policy(timestamp)
+                # Publish only after every validation and retention step succeeds.
+                for attr in ('_data', '_history', '_key_revisions', '_revision',
+                             '_oldest_revision', '_times', '_indexes',
+                             '_composite_indexes', '_range_indexes'):
+                    setattr(self, attr, getattr(candidate, attr))
+        finally:
+            with self._lock:
                 self._transaction_active = False
 
     def __setitem__(self, key, value):
