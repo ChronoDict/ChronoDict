@@ -19,7 +19,15 @@ Historical point lookup uses binary search over key revisions. Indexed equality 
 ## Development Roadmap
 Phase	Development scope	                            Status
 1	    Core dictionary implementation	                Implemented
-2	    Advanced indexing and mutation tracking	        Pending
+2	    Advanced indexing and mutation tracking	        working
+
+    2.1	Dynamic index creation and removal                 Completed
+    2.2	Range-based indexing (gt, lt, gte, lte)	           Completed
+    2.3	Nested mutation tracking	                       Completed
+    2.4	Composite indexes	                               Completed
+    2.5	Historical timestamp-based retrieval	           Completed
+    2.6	Comprehensive regression testing	               working
+
 3	    Memory optimization and delta compression	    Pending
 4	    Transactions and concurrency	                Pending
 5	    Performance benchmarking	                    Pending
