@@ -52,5 +52,26 @@ Phase	Development scope	                               Status
         5.5	CPU and memory profiling                                Completed
         5.6	Performance optimization and final benchmark report     Completed       
 
-6	    a. Production hardening and b. PyPI publishing	    Pending
+6	    a. Production hardening (done) and b. PyPI publishing	    Working
+
 7	    Native C/Rust acceleration and PEP evaluation	    Research
+        7.1	Unified Python-Rust interface and backend selection	                Pending
+        7.2	Native support for nested dictionaries, lists and Python objects	Pending
+        7.3	Native composite indexes and advanced queries	                    Pending
+        7.4	Native timestamp retrieval, retention and compaction	            Pending
+        7.5	Native transactions, isolation and conflict detection	            Pending
+        7.6	Comprehensive native parity tests and integration validation	    Pending
+
+Phase 7 development rules
+- Preserve the existing Python reference implementation.
+- Maintain backward compatibility with all public APIs.
+- Use Rust and PyO3 for performance-critical operations.
+- Modify only required files.
+- Include dedicated Rust and Python unit tests.
+- Verify functional parity before enabling the native engine by default.
+The objective is to retain the existing interface:
+example: 
+from chronodict import ChronoDict
+d = ChronoDict(indexes=["salary"])
+
+Users should not need to interact directly with Rust or NativeEngine.
