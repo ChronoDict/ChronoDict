@@ -1,4 +1,4 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates, bounded delta history and configurable retention."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates, bounded delta history configurable retention and history compaction."""
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
@@ -287,18 +287,59 @@ class ChronoDict(MutableMapping):
 
     @staticmethod
     def _trim_postings(index, floor):
-        """Keep intervals intersecting the retained timeline."""
+        """Discard expired intervals using binary search over their starts."""
         result = {}
         for value, postings in index.items():
             retained = {}
             for key, intervals in postings.items():
-                active = [[max(start, floor), end] for start, end in intervals
-                          if end is None or end > floor]
-                if active:
+                pos = bisect_right(intervals, floor, key=lambda interval: interval[0])
+                if pos and (intervals[pos - 1][1] is None or intervals[pos - 1][1] > floor):
+                    pos -= 1
+                if pos < len(intervals):
+                    active = intervals[pos:]
+                    start, end = active[0]
+                    if start < floor:
+                        active[0] = [floor, end]
                     retained[key] = active
             if retained:
                 result[value] = retained
         return result
+
+    def compact(self):
+        """Apply retention and repack history without creating a revision.
+
+        Retained states and timestamps are unchanged. Unreachable objects are
+        released to Python's memory manager; no global GC is forced. Return
+        the retained floor and record counts before and after compaction.
+        """
+        with self._lock:
+            before = sum(map(len, self._history.values()))
+            self.prune()
+            history = {}
+            for key, records in self._history.items():
+                packed = []
+                old = _MISSING
+                for revision, value in self._iter_history(records):
+                    shareable = (old is not _MISSING and value is not _MISSING
+                                 and _plain_tree(old) and _plain_tree(value))
+                    packed.append(self._history_record(packed, revision, old,
+                                                       value, shareable))
+                    old = value
+                if packed:
+                    history[key] = packed
+            floor = self._oldest_revision
+            indexes = {field: self._trim_postings(index, floor)
+                       for field, index in self._indexes.items()}
+            composites = {fields: self._trim_postings(index, floor)
+                          for fields, index in self._composite_indexes.items()}
+            ranges = {field: {domain: list(values) for domain, values in groups.items()
+                              if values}
+                      for field, groups in self._range_indexes.items()}
+            self._history, self._indexes = history, indexes
+            self._composite_indexes, self._range_indexes = composites, ranges
+            self._times = list(self._times)
+            return {'oldest_revision': floor, 'records_before': before,
+                    'records_after': sum(map(len, history.values()))}
 
     def _prune_before(self, floor):
         """Materialize boundary checkpoints before releasing expired history."""
@@ -308,7 +349,9 @@ class ChronoDict(MutableMapping):
             if not pos:
                 history[key] = records
                 continue
-            boundary = self._at(key, floor)
+            boundary_record = records[pos - 1]
+            boundary = (self._at(key, floor) if boundary_record[2]
+                        else boundary_record[1])
             retained = records[pos:]
             if boundary is not _MISSING:
                 retained.insert(0, (floor, boundary, False))
@@ -318,8 +361,8 @@ class ChronoDict(MutableMapping):
                    for field, index in self._indexes.items()}
         # Filter the existing ordered domains, rather than reconstructing from
         # equality keys (equal cross-type numeric keys may share a posting).
-        ranges = {field: {domain: [v for v in values if v in indexes[field]]
-                          for domain, values in groups.items()}
+        ranges = {field: {domain: kept for domain, values in groups.items()
+                          if (kept := [v for v in values if v in indexes[field]])}
                   for field, groups in self._range_indexes.items()}
         composites = {fields: self._trim_postings(index, floor)
                       for fields, index in self._composite_indexes.items()}

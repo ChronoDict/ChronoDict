@@ -1,6 +1,7 @@
 # ChronoDict
 
 **A time-aware indexed dictionary for Python.**
+**It supports automatically versioned temporal indexing, version-aware key-value.**
 
 v1.0: an in-memory MutableMapping with revision history and temporal secondary equality indexes. No runtime dependencies.
 

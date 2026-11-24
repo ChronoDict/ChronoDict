@@ -33,8 +33,8 @@ Phase	Development scope	                            Status
         3.1	Structural sharing	                        Completed
         3.2	Eliminate redundant deep copies	            Completed
         3.3	Delta-based revision storage	            Completed
-        3.4	Configurable history retention	            Working
-        3.5	History compaction and garbage collection	Pending
+        3.4	Configurable history retention	            Completed
+        3.5	History compaction and garbage collection	Working
         3.6	Memory benchmarking and regression testing	Pending
 
 4	    Transactions and concurrency	                    Pending
