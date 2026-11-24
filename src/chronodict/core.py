@@ -1,4 +1,5 @@
-"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates, bounded delta history configurable retention and history compaction."""
+"""In-memory versioned mapping with temporal equality, range and composite indexes, with UTC timestamp retrieval conservative structural sharing, copy-efficient updates, bounded delta history configurable retention and history compaction, with atomic staged transactions."""
+from contextlib import contextmanager
 from bisect import bisect_left, bisect_right
 from collections.abc import MutableMapping, Mapping, MutableSequence
 from operator import gt, ge, lt, le
@@ -222,6 +223,8 @@ class ChronoDict(MutableMapping):
 
     def __init__(self, data=None, *, indexes=(), track_mutations=True, max_revisions=None, max_age=None):
         self._lock = RLock()
+        self._transaction_active = False
+        self._transaction_stage = False
         self._track_mutations = track_mutations
         self._data = {}
         self._history = {}
@@ -258,6 +261,7 @@ class ChronoDict(MutableMapping):
         Discarded history cannot be recovered by relaxing retention.
         """
         with self._lock:
+            self._check_transaction_configuration()
             count = self._max_revisions if max_revisions is _UNCHANGED else max_revisions
             age = self._max_age if max_age is _UNCHANGED else max_age
             self._validate_retention(count, age)
@@ -267,6 +271,7 @@ class ChronoDict(MutableMapping):
     def prune(self):
         """Apply retention now, including after an idle period; return floor."""
         with self._lock:
+            self._check_transaction_configuration()
             return self._prune_policy(max(self._times[-1], datetime.now(timezone.utc)))
 
     def _prune_policy(self, now):
@@ -313,6 +318,7 @@ class ChronoDict(MutableMapping):
         the retained floor and record counts before and after compaction.
         """
         with self._lock:
+            self._check_transaction_configuration()
             before = sum(map(len, self._history.values()))
             self.prune()
             history = {}
@@ -435,10 +441,12 @@ class ChronoDict(MutableMapping):
             value = self._apply_delta(value, payload) if is_delta else payload
             yield revision, value
 
-    def _commit(self, key, value, deleted=False, *, _owned=False):
+    def _commit(self, key, value, deleted=False, *, _owned=False, _batch=None):
         """Commit a revision; _owned is reserved for internal plain-tree updates."""
         hash(key)
         with self._lock:
+            if self._transaction_active:
+                raise RuntimeError("Write through the transaction mapping")
             if deleted and key not in self._data:
                 raise KeyError(key)
             old = self._data.get(key, _MISSING)
@@ -453,9 +461,10 @@ class ChronoDict(MutableMapping):
             composite_transitions = [(fields, self._composite_value(old, fields),
                                       self._composite_value(new, fields))
                                      for fields in self._composite_indexes]
-            revision = self._revision + 1
+            revision = self._revision + 1 if _batch is None else _batch[0]
             # Keep the revision timeline sorted even if the system clock moves backward.
-            timestamp = max(self._times[-1], datetime.now(timezone.utc))
+            timestamp = (max(self._times[-1], datetime.now(timezone.utc))
+                         if _batch is None else _batch[1])
             record = self._history_record(self._history.get(key, ()), revision,
                                           old, new, shareable)
             for field, before, after in transitions:
@@ -478,8 +487,89 @@ class ChronoDict(MutableMapping):
                 self._data[key] = new
                 self._key_revisions[key] = revision
             self._revision = revision
-            self._times.append(timestamp)
-            self._prune_policy(timestamp)
+            if _batch is None:
+                self._times.append(timestamp)
+                self._prune_policy(timestamp)
+
+    def _check_transaction_configuration(self):
+        """Keep index definitions and retention fixed during a transaction."""
+        if self._transaction_active or self._transaction_stage:
+            raise RuntimeError("Configuration changes are not transactional")
+
+    @staticmethod
+    def _copy_postings(index):
+        """Copy mutable posting metadata without copying keys or values."""
+        return {value: {key: [interval.copy() for interval in intervals]
+                        for key, intervals in postings.items()}
+                for value, postings in index.items()}
+
+    def _transaction_candidate(self):
+        """Create unpublished metadata for an atomic commit."""
+        candidate = ChronoDict(track_mutations=self._track_mutations,
+                               max_revisions=self._max_revisions,
+                               max_age=self._max_age)
+        candidate._data = self._data.copy()
+        candidate._history = {k: records.copy() for k, records in self._history.items()}
+        candidate._key_revisions = self._key_revisions.copy()
+        candidate._revision = self._revision
+        candidate._oldest_revision = self._oldest_revision
+        candidate._times = self._times.copy()
+        candidate._indexes = {f: self._copy_postings(i) for f, i in self._indexes.items()}
+        candidate._composite_indexes = {f: self._copy_postings(i)
+                                        for f, i in self._composite_indexes.items()}
+        candidate._range_indexes = {f: {d: values.copy() for d, values in groups.items()}
+                                    for f, groups in self._range_indexes.items()}
+        return candidate
+
+    @contextmanager
+    def transaction(self):
+        """Yield an isolated writable mapping; commit its final changes as one revision.
+
+        Use the yielded mapping, not the owner, for writes and read-your-writes.
+        The owner exposes committed state and holds its lock until exit. Exceptions
+        escaping the block abort all staged changes. Nested transactions and index
+        or retention changes are unsupported. The staging mapping has a private
+        revision timeline and is detached from the owner after exit.
+        """
+        with self._lock:
+            if self._transaction_active or self._transaction_stage:
+                raise RuntimeError("Nested transactions are not supported")
+            self._transaction_active = True
+            try:
+                stage = ChronoDict(track_mutations=self._track_mutations)
+                stage._data = {k: deepcopy(v) for k, v in self._data.items()}
+                stage._history = {k: [(0, v, False)] for k, v in stage._data.items()}
+                stage._key_revisions = dict.fromkeys(stage._data, 0)
+                for field in self._indexes:
+                    stage.create_index(field)
+                for fields in self._composite_indexes:
+                    stage.create_composite_index(*fields)
+                stage._transaction_stage = True
+                yield stage
+                with stage._lock:
+                    touched = [k for k, records in stage._history.items()
+                               if records[-1][0] > 0 and
+                               (k in stage._data or k in self._data)]
+                    if not touched:
+                        return
+                    candidate = self._transaction_candidate()
+                    revision = self._revision + 1
+                    timestamp = max(self._times[-1], datetime.now(timezone.utc))
+                    for key in touched:
+                        deleted = key not in stage._data
+                        candidate._commit(key, stage._data.get(key), deleted=deleted,
+                                          _batch=(revision, timestamp))
+                    # Preserve insertion order, including delete/reinsert sequences.
+                    candidate._data = {k: candidate._data[k] for k in stage._data}
+                    candidate._times.append(timestamp)
+                    candidate._prune_policy(timestamp)
+                    # Publish only after every validation and retention step succeeds.
+                    for attr in ('_data', '_history', '_key_revisions', '_revision',
+                                 '_oldest_revision', '_times', '_indexes',
+                                 '_composite_indexes', '_range_indexes'):
+                        setattr(self, attr, getattr(candidate, attr))
+            finally:
+                self._transaction_active = False
 
     def __setitem__(self, key, value):
         self._commit(key, value)
@@ -707,6 +797,7 @@ class ChronoDict(MutableMapping):
         if not isinstance(field, str) or not field:
             raise ValueError('Index field must be a non-empty string')
         with self._lock:
+            self._check_transaction_configuration()
             if field in self._indexes:
                 raise ValueError(f'Index already exists: {field}')
             index = {}
@@ -731,6 +822,7 @@ class ChronoDict(MutableMapping):
     def drop_index(self, field):
         """Remove an index without changing values or revision history."""
         with self._lock:
+            self._check_transaction_configuration()
             del self._indexes[field]
             del self._range_indexes[field]
 
@@ -773,6 +865,7 @@ class ChronoDict(MutableMapping):
         """Index complete field combinations across all retained revisions."""
         fields = self._normalize_composite(fields)
         with self._lock:
+            self._check_transaction_configuration()
             if fields in self._composite_indexes:
                 raise ValueError(f'Composite index already exists: {fields}')
             index = {}
@@ -788,6 +881,7 @@ class ChronoDict(MutableMapping):
         """Remove a composite index without modifying data or history."""
         fields = self._normalize_composite(fields)
         with self._lock:
+            self._check_transaction_configuration()
             del self._composite_indexes[fields]
 
     def rollback(self, key, *, version=None, at=None):
