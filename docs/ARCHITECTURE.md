@@ -4,7 +4,7 @@
 
 `chronodict.ChronoDict` is the public API. The default Python backend manages values, history, query planning, retention, transactions, and branches. The optional `backend="native"` path invokes `chronodict._native.active_posting_keys` to select active keys from temporal index entries. The query planner and result validation stay in Python. Rust uses PyO3 to read Python postings and return a set of matching keys. It holds the GIL while it does this work.
 
-Maturin builds Python and the Rust extension into the same `chronodict` distribution. The Rust crate also contains a standalone string-key, integer-record engine that is exercised by the Cargo tests. That engine is a development preview. Its data model is separate from the public mapping's storage path. [Roadmap](../project-map.md)
+Maturin builds Python and the Rust extension into the same `chronodict` distribution. The Rust crate also contains a standalone string-key, integer-record engine that is exercised by the Cargo tests. That engine is a development preview. Its data model is separate from the public mapping's storage path.
 
 ## Values and revisions
 

@@ -6,8 +6,8 @@ ChronoDict supports CPython 3.10 through 3.14 with the GIL enabled. The default 
 
 ## Documentation
 
-[Installation and commands](https://github.com/ChronoDict/ChronoDict/blob/main/docs/COMMANDS.md) · [Syntax and examples](https://github.com/ChronoDict/ChronoDict/blob/main/docs/SYNTAX.md) · [API reference](https://github.com/ChronoDict/ChronoDict/blob/main/docs/API.md)
+[Syntax and examples](https://github.com/ChronoDict/ChronoDict/blob/main/docs/SYNTAX.md) · [API reference](https://github.com/ChronoDict/ChronoDict/blob/main/docs/API.md)
 
-[Architecture](https://github.com/ChronoDict/ChronoDict/blob/main/docs/ARCHITECTURE.md) · [FAQ](https://github.com/ChronoDict/ChronoDict/blob/main/docs/FAQ.md)
+[Architecture](https://github.com/ChronoDict/ChronoDict/blob/main/docs/ARCHITECTURE.md) · [Contributing](https://github.com/ChronoDict/ChronoDict/blob/main/CONTRIBUTING.md) ·
 
-[Contributing](https://github.com/ChronoDict/ChronoDict/blob/main/CONTRIBUTING.md) · [Changelog](https://github.com/ChronoDict/ChronoDict/blob/main/CHANGELOG.md) · [Security](https://github.com/ChronoDict/ChronoDict/blob/main/SECURITY.md) · [Roadmap](https://github.com/ChronoDict/ChronoDict/blob/main/project-map.md) · [MIT license](https://github.com/ChronoDict/ChronoDict/blob/main/LICENSE)
+[License](https://github.com/ChronoDict/ChronoDict/blob/main/LICENSE)

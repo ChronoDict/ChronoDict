@@ -184,4 +184,4 @@ data = ChronoDict(indexes=["status"], backend="python")
 assert data.backend == "python"
 ```
 
-Use `backend="native"` with a build that includes the extension. Both backends use the same mapping and query syntax. [API reference](API.md) · [Build commands](COMMANDS.md)
+Use `backend="native"` with a build that includes the extension. Both backends use the same mapping and query syntax. [API reference](API.md)
