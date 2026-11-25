@@ -33,4 +33,4 @@ A branch keeps the retained prefix through the fork point and has its own timeli
 
 ## Scope
 
-ChronoDict stores data in process memory. Its locks coordinate access within a process. The mapping provides versioned state, secondary indexes, and atomic publication in memory. [API contract](API.md) · [Benchmark commands](COMMANDS.md#benchmark-and-profile)
+ChronoDict stores data in process memory. Its locks coordinate access within a process. The mapping provides versioned state, secondary indexes, and atomic publication in memory. [API contract](API.md)
