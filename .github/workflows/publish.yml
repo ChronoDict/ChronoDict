@@ -1,0 +1,37 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub Release tag with prebuilt ChronoDict wheels attached
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Upload wheels to PyPI
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-pypi
+      cancel-in-progress: false
+    environment:
+      name: pypi
+      url: https://pypi.org/project/chronodict/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download wheels from the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          : "${RELEASE_TAG:?Enter a GitHub Release tag}"
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'chronodict-*.whl' --dir dist -- "$RELEASE_TAG"
+      - name: Publish wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
