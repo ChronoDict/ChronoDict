@@ -6,8 +6,8 @@ ChronoDict requires Python 3.10 or later. The default backend is Python, with op
 
 ## Documentation
 
-[Installation and commands](docs/COMMANDS.md) · [Syntax and examples](docs/SYNTAX.md) · [API reference](docs/API.md)
+[Installation and commands](https://github.com/ChronoDict/ChronoDict/blob/main/docs/COMMANDS.md) · [Syntax and examples](https://github.com/ChronoDict/ChronoDict/blob/main/docs/SYNTAX.md) · [API reference](https://github.com/ChronoDict/ChronoDict/blob/main/docs/API.md)
 
-[Architecture](docs/ARCHITECTURE.md) · [FAQ](docs/FAQ.md)
+[Architecture](https://github.com/ChronoDict/ChronoDict/blob/main/docs/ARCHITECTURE.md) · [FAQ](https://github.com/ChronoDict/ChronoDict/blob/main/docs/FAQ.md)
 
-[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Roadmap](project-map.md) · [MIT license](LICENSE)
+[Contributing](https://github.com/ChronoDict/ChronoDict/blob/main/CONTRIBUTING.md) · [Changelog](https://github.com/ChronoDict/ChronoDict/blob/main/CHANGELOG.md) · [Security](https://github.com/ChronoDict/ChronoDict/blob/main/SECURITY.md) · [Roadmap](https://github.com/ChronoDict/ChronoDict/blob/main/project-map.md) · [MIT license](https://github.com/ChronoDict/ChronoDict/blob/main/LICENSE)
