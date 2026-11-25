@@ -89,6 +89,38 @@ class IndexEdges(unittest.TestCase):
 
 
 class MutationEdges(unittest.TestCase):
+    def test_list_augmented_assignment_creates_one_revision(self):
+        data = ChronoDict({'root': [1], 'nested': {'items': [[2]]}})
+        data['root'] += [3]
+        self.assertEqual(data.revision, 3)
+        self.assertEqual(data.get('root'), [1, 3])
+
+        parent = data['nested']
+        stale = data['nested']
+        parent['items'] += [[4]]
+        self.assertEqual(data.revision, 4)
+        self.assertEqual(parent['items'], [[2], [4]])
+        with self.assertRaises(RuntimeError):
+            stale['items'] += [[5]]
+
+        data['nested']['items'][0] += [6]
+        self.assertEqual(data.revision, 5)
+        self.assertEqual(data.get('nested'), {'items': [[2, 6], [4]]})
+        self.assertEqual(data.get('nested', version=4), {'items': [[2], [4]]})
+
+    def test_augmented_list_view_can_be_assigned_elsewhere(self):
+        data = ChronoDict({'a': {'items': [1], 'other': []}})
+        stale = data['a']
+        items = data['a']['items']
+        items += [2]
+        self.assertEqual(data.revision, 2)
+        with self.assertRaises(RuntimeError):
+            stale['items'] = items
+        data['a']['other'] = items
+        data['a']['other'].append(3)
+        self.assertEqual(data.get('a'), {'items': [1, 2], 'other': [1, 2, 3]})
+        self.assertEqual(data.revision, 4)
+
     def test_dict_mutators(self):
         d = ChronoDict({1: {'x': 1}}, indexes=['x'])
         view = d[1]
@@ -185,6 +217,24 @@ class TimestampEdges(unittest.TestCase):
 
 
 class StorageEdges(unittest.TestCase):
+    def test_flat_replacement_preserves_field_order_and_key_identity(self):
+        original_key = ''.join(['field', '-name'])
+        replacement_key = original_key.encode().decode()
+        self.assertEqual(original_key, replacement_key)
+        self.assertIsNot(original_key, replacement_key)
+        data = ChronoDict(indexes=['score'])
+        data['row'] = {original_key: 'value', 'score': 1}
+        data['row'] = {replacement_key: 'value', 'score': 1}
+        data['row'] = {'score': 2, replacement_key: 'value'}
+
+        self.assertIs(next(iter(data.get('row', version=1))), original_key)
+        self.assertIs(next(iter(data.get('row', version=2))), replacement_key)
+        current = data.get('row')
+        self.assertEqual(list(current), ['score', replacement_key])
+        self.assertEqual(data.find(score=1, version=2), {'row': data.get('row', version=2)})
+        current['score'] = 3
+        self.assertEqual(data.get('row')['score'], 2)
+
     def test_scalar_type_and_signed_zero(self):
         d = ChronoDict({1: {'x': 0.0}})
         d.patch(1, x=-0.0)
@@ -237,6 +287,44 @@ class StorageEdges(unittest.TestCase):
             self.assertEqual(d.get(1, version=v), {'x': 1, 'y': 2})
             self.assertIn(1, d.find(version=v, x=1, y=2))
             self.assertIn(1, d.find(version=v, x__gte=1))
+
+    def test_untouched_history_uses_current_retention_boundary(self):
+        Clock.current = Clock(2035, 1, 1, tzinfo=timezone.utc)
+        with patch('chronodict.core.datetime', Clock):
+            d = ChronoDict(indexes=['score'], max_revisions=3)
+            d['cold'] = {'score': 1}
+            for score in range(10, 16):
+                Clock.current += timedelta(seconds=1)
+                d['hot'] = {'score': score}
+
+            floor = d.oldest_revision
+            timestamp = d.timestamp(floor)
+            self.assertEqual(d.history('cold'), [
+                {'version': floor, 'timestamp': timestamp, 'deleted': False, 'value': {'score': 1}},
+            ])
+            self.assertEqual(d.find(at=timestamp, score=1), {'cold': {'score': 1}})
+            with self.assertRaises(ValueError):
+                d.snapshot(floor - 1)
+            d.rollback('hot', at=timestamp)
+            self.assertEqual(d.get('hot'), {'score': 13})
+            d.compact()
+            self.assertEqual(d.history('cold')[0]['version'], d.oldest_revision)
+            self.assertEqual(d.get('cold', version=d.oldest_revision), {'score': 1})
+
+    def test_rebuilt_indexes_expire_numeric_bucket_aliases(self):
+        d = ChronoDict(max_revisions=3)
+        d['target'] = {'score': True, 'team': 'IT'}
+        d.patch('target', score=1)
+        d.patch('target', score=2)
+        d.create_index('score')
+        d.create_composite_index('score', 'team')
+        d['clock'] = None
+        self.assertEqual(d.find(version=2, score__lte=1), {'target': {'score': 1, 'team': 'IT'}})
+        d['clock'] = None
+        self.assertEqual(d.oldest_revision, 3)
+        self.assertEqual(d.find(score__lte=1), {})
+        self.assertEqual(d.find(score=1, team='IT'), {})
+        self.assertEqual(d.find(score__gte=2), {'target': {'score': 2, 'team': 'IT'}})
 
     def test_empty_and_single_revision_compaction(self):
         d = ChronoDict(max_revisions=1)

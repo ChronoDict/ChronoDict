@@ -188,9 +188,9 @@ class PhaseThreeStorageTests(unittest.TestCase):
         d[2] = 2
         self.assertIsNotNone(ref())
         d.set_retention(max_revisions=1)
-        d.compact()
         gc.collect()
         self.assertIsNone(ref())
+        d.compact()
         self.assertEqual(d.snapshot(), {2: 2})
 
     def test_live_view_survives_compaction(self):

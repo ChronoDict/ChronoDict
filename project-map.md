@@ -3,18 +3,18 @@
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Mapping API, revision history, temporal equality indexes, rollback, tests | Prototype implemented |
-| 2 | Formal mutation semantics, dynamic indexes, range indexes, randomized reference-model tests | Planned |
-| 3 | Structural sharing, delta encoding, retention, compaction | Planned |
-| 4 | Atomic transactions, concurrent snapshots, isolation | Planned |
-| 5 | Performance benchmarks against dict and existing indexed/persistent mappings | Planned |
-| 6 | Packaging, CI, compatibility review, security and release documentation | Planned |
-| 7 | Evaluate C/Rust acceleration and potential Python enhancement proposal | Research |
+| 2 | Formal mutation semantics, dynamic indexes, range indexes, randomized reference-model tests | Implemented |
+| 3 | Structural sharing, delta encoding, retention, compaction | Implemented |
+| 4 | Atomic transactions, concurrent snapshots, isolation | Implemented |
+| 5 | Performance benchmarking and profiling | Implemented |
+| 6 | Packaging, CI, compatibility review, security and release documentation | In progress alongside Phase 7 |
+| 7 | Evaluate C/Rust acceleration and potential Python enhancement proposal | In progress |
 
 ## Architecture
 
 Primary hash table -> per-key revision history -> temporal secondary indexes -> historical query engine.
 
-Historical point lookup uses binary search over key revisions. Indexed equality search visits keys ever associated with the indexed value and binary-searches their intervals. It is not guaranteed to be O(1 + results), especially with long histories. Range queries, persistence and transactions are not implemented.
+Historical point lookup uses binary search over per-key revisions. Indexed equality search visits keys associated with the indexed value in retained history and binary-searches their intervals. Range searches select matching indexed values first. Transactions stage writes privately and publish a batch as one revision. Storage is in memory.
 
 ## Development Roadmap
 Phase	Development scope	                               Status
@@ -52,15 +52,15 @@ Phase	Development scope	                               Status
         5.5	CPU and memory profiling                                Completed
         5.6	Performance optimization and final benchmark report     Completed       
 
-6	    a. Production hardening (done) and b. PyPI publishing	    Working
+6	    Production hardening and PyPI publishing	            Working
 
-7	    Native C/Rust acceleration and PEP evaluation	    Research
-        7.1	Unified Python-Rust interface and backend selection	                Pending
-        7.2	Native support for nested dictionaries, lists and Python objects	Pending
-        7.3	Native composite indexes and advanced queries	                    Pending
-        7.4	Native timestamp retrieval, retention and compaction	            Pending
-        7.5	Native transactions, isolation and conflict detection	            Pending
-        7.6	Comprehensive native parity tests and integration validation	    Pending
+7	    Add Native C/Rust acceleration and PEP evaluation	                        Working
+        7.1	Unified Python-Rust interface and backend selection	                    Working
+        7.2	Native support for nested dictionaries, lists and Python objects	    Working
+        7.3	Native composite indexes and advanced queries	                        Working
+        7.4	Native timestamp retrieval, retention and compaction	                Working
+        7.5	Native transactions, isolation and conflict detection	                Working
+        7.6	Comprehensive native parity tests and integration validation	        Working
 
 Phase 7 development rules
 - Preserve the existing Python reference implementation.
@@ -69,9 +69,13 @@ Phase 7 development rules
 - Modify only required files.
 - Include dedicated Rust and Python unit tests.
 - Verify functional parity before enabling the native engine by default.
-The objective is to retain the existing interface:
-example: 
+The Python import and constructor remain the entry point.
+
+```python
 from chronodict import ChronoDict
 d = ChronoDict(indexes=["salary"])
+```
 
-Users should not need to interact directly with Rust or NativeEngine.
+The first Phase 7.1 integration, `ChronoDict(backend="native")`, delegates temporal index lookups to Rust. The `chronodict` distribution bundles the Python package and compiled extension in one wheel per supported platform and ABI. Python stores values and history and manages revisions, retention, and transactions for both backends. The full native storage and parity milestones remain open.
+
+Earlier-phase work continues alongside the integration. The tracked-list `+=` regression is fixed. Transaction setup and commit still copy mapping-wide state, and release validation across Python versions and platforms remains open.
